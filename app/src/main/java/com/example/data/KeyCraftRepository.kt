@@ -33,10 +33,10 @@ class KeyCraftRepository(
         }
     }
 
-    fun recordCommittedWordAsync(word: String, prevWord: String?) {
+    fun recordCommittedWordAsync(word: String, prevWord: String?, prevPrevWord: String? = null) {
         val clean = word.trim()
         if (clean.length < 2 && clean.lowercase() != "i") return
-        engine.recordCommittedWord(clean, prevWord)
+        engine.recordCommittedWord(clean, prevWord, prevPrevWord)
 
         scope.launch {
             val lower = clean.lowercase()

@@ -44,5 +44,7 @@ data class KeyboardUiState(
     val lastAutoCorrectOriginal: String? = null,
     val activePopup: ActiveKeyPopup? = null,
     val enterAction: EnterActionType = EnterActionType.NEWLINE,
-    val showGlobeKey: Boolean = false
+    val showGlobeKey: Boolean = false,
+    val isPasswordField: Boolean = false,
+    val disableAutoCorrectForField: Boolean = false
 )

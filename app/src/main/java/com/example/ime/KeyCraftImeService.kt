@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.text.InputType
 import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
@@ -36,6 +37,8 @@ import com.example.ui.keyboard.EnterActionType
 import com.example.ui.keyboard.InputTarget
 import com.example.ui.keyboard.KeyCraftKeyboardView
 import com.example.ui.keyboard.KeyboardController
+import com.example.ui.keyboard.KeyboardLayoutMode
+import com.example.ui.keyboard.ShiftState
 import com.example.ui.theme.KeyCraftTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -59,7 +62,9 @@ class KeyCraftImeService :
     override val viewModelStore: ViewModelStore get() = store
     override val savedStateRegistry: SavedStateRegistry get() = savedStateController.savedStateRegistry
 
-    private lateinit var controller: KeyboardController
+    internal lateinit var controller: KeyboardController
+        private set
+
     private var latestSettings = KeyboardSettings()
     private var latestSnippets: List<SnippetEntity> = emptyList()
 
@@ -71,13 +76,21 @@ class KeyCraftImeService :
         }
     }
 
-    private val imeInputTarget = object : InputTarget {
+    internal val imeInputTarget = object : InputTarget {
         override fun getTextBeforeCursor(maxChars: Int): String {
             return currentInputConnection?.getTextBeforeCursor(maxChars, 0)?.toString().orEmpty()
         }
 
         override fun commitText(text: String) {
             currentInputConnection?.commitText(text, 1)
+        }
+
+        override fun setComposingText(text: String) {
+            currentInputConnection?.setComposingText(text, 1)
+        }
+
+        override fun finishComposingText() {
+            currentInputConnection?.finishComposingText()
         }
 
         override fun deleteBeforeCursor(count: Int) {
@@ -149,7 +162,7 @@ class KeyCraftImeService :
     override fun onCreate() {
         super.onCreate()
         savedStateController.performRestore(null)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+        moveLifecycleTo(Lifecycle.State.CREATED)
 
         val repo = (application as KeyCraftApplication).container.repository
         controller = KeyboardController(repo, imeInputTarget)
@@ -211,11 +224,47 @@ class KeyCraftImeService :
         }
     }
 
+    override fun onEvaluateFullscreenMode(): Boolean {
+        // Keep the host editor visible alongside the soft keyboard.
+        return false
+    }
+
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
+        val inputType = info?.inputType ?: 0
+        val typeClass = inputType and InputType.TYPE_MASK_CLASS
+        val variation = inputType and InputType.TYPE_MASK_VARIATION
+
+        val isPasswordField = when (typeClass) {
+            InputType.TYPE_CLASS_TEXT -> variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD
+            InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            else -> false
+        }
+
+        val noSuggestionsFlag = (inputType and InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS) != 0
+        val isStructuredField = typeClass == InputType.TYPE_CLASS_TEXT && (
+            variation == InputType.TYPE_TEXT_VARIATION_URI ||
+                variation == InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS ||
+                variation == InputType.TYPE_TEXT_VARIATION_WEB_EMAIL_ADDRESS
+            )
+
+        val initialLayout = when (typeClass) {
+            InputType.TYPE_CLASS_NUMBER, InputType.TYPE_CLASS_PHONE -> KeyboardLayoutMode.SYMBOLS_1
+            else -> KeyboardLayoutMode.QWERTY
+        }
+
+        val initialShift = when {
+            (inputType and InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS) != 0 -> ShiftState.CAPS_LOCK
+            (currentInputConnection?.getCursorCapsMode(inputType) ?: 0) != 0 -> ShiftState.ONCE
+            else -> ShiftState.OFF
+        }
+
         val imeAction = (info?.imeOptions ?: 0) and EditorInfo.IME_MASK_ACTION
-        val isMultiLine = (info?.inputType ?: 0) and EditorInfo.TYPE_TEXT_FLAG_MULTI_LINE != 0
-        val actionType = if (isMultiLine && imeAction == EditorInfo.IME_ACTION_UNSPECIFIED) {
+        val isMultiLine = (inputType and InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0
+        val noEnterAction = ((info?.imeOptions ?: 0) and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        val actionType = if ((isMultiLine && imeAction == EditorInfo.IME_ACTION_UNSPECIFIED) || noEnterAction) {
             EnterActionType.NEWLINE
         } else {
             when (imeAction) {
@@ -227,13 +276,34 @@ class KeyCraftImeService :
                 else -> EnterActionType.NEWLINE
             }
         }
+
         val showGlobe = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             shouldOfferSwitchingToNextInputMethod()
         } else {
             true
         }
-        controller.setEnvironmentFlags(actionType, showGlobe)
+
+        controller.setEnvironmentFlags(
+            enterAction = actionType,
+            showGlobe = showGlobe,
+            isPasswordField = isPasswordField,
+            disableAutoCorrectForField = isPasswordField || noSuggestionsFlag || isStructuredField,
+            initialLayoutMode = initialLayout,
+            initialShiftState = initialShift
+        )
         controller.refreshContext(latestSettings, latestSnippets)
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        controller.resetComposingState()
+    }
+
+    override fun onFinishInput() {
+        super.onFinishInput()
+        if (::controller.isInitialized) {
+            controller.resetComposingState()
+        }
     }
 
     override fun onUpdateSelection(
@@ -245,27 +315,46 @@ class KeyCraftImeService :
         candidatesEnd: Int
     ) {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        if (candidatesStart == -1 && candidatesEnd == -1) {
+            controller.resetComposingState()
+        }
         controller.refreshContext(latestSettings, latestSnippets)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && ::controller.isInitialized) {
+            val mode = controller.uiState.value.layoutMode
+            if (mode != KeyboardLayoutMode.QWERTY) {
+                controller.setLayoutMode(KeyboardLayoutMode.QWERTY)
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onWindowShown() {
         super.onWindowShown()
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        moveLifecycleTo(Lifecycle.State.RESUMED)
         controller.refreshContext(latestSettings, latestSnippets)
     }
 
     override fun onWindowHidden() {
         super.onWindowHidden()
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        controller.resetComposingState()
+        moveLifecycleTo(Lifecycle.State.CREATED)
     }
 
     override fun onDestroy() {
         super.onDestroy()
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
+        moveLifecycleTo(Lifecycle.State.DESTROYED)
         store.clear()
         serviceScope.cancel()
+    }
+
+    private fun moveLifecycleTo(targetState: Lifecycle.State) {
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) {
+            lifecycleRegistry.currentState = targetState
+        }
     }
 }

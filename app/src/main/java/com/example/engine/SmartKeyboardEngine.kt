@@ -6,7 +6,6 @@ import com.example.data.SnippetEntity
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
@@ -45,8 +44,7 @@ data class EngineResult(
 class SmartKeyboardEngine {
 
     private val trie = TrieIndex()
-    private val learnedBigrams = ConcurrentHashMap<String, ConcurrentHashMap<String, Int>>()
-    private val learnedUnigrams = ConcurrentHashMap<String, Int>()
+    val ngramPredictor = NGramPredictor()
 
     init {
         BuiltInLexicon.coreWords.forEach { (word, freq) ->
@@ -59,36 +57,33 @@ class SmartKeyboardEngine {
         bigrams: List<Triple<String, String, Int>>
     ) {
         customWords.forEach { (word, freq, isCustom) ->
-            val lower = word.lowercase()
-            learnedUnigrams[lower] = freq
             trie.insert(word, 2200 + freq * 25, isCustom = isCustom)
         }
-        bigrams.forEach { (prev, next, count) ->
-            val p = prev.lowercase()
-            val n = next.lowercase()
-            val map = learnedBigrams.getOrPut(p) { ConcurrentHashMap() }
-            map[n] = max(map[n] ?: 0, count)
-        }
+        ngramPredictor.loadLearned(
+            unigrams = customWords.map { it.first to it.second },
+            bigrams = bigrams
+        )
     }
 
     fun resetLearnedMemory() {
-        learnedBigrams.clear()
-        learnedUnigrams.clear()
+        ngramPredictor.reset()
     }
 
-    fun recordCommittedWord(word: String, prevWord: String?) {
+    fun recordCommittedWord(
+        word: String,
+        prevWord: String?,
+        prevPrevWord: String? = null
+    ) {
         val clean = word.trim()
         if (clean.length < 2 && clean.lowercase() != "i") return
         val lower = clean.lowercase()
-        val newFreq = (learnedUnigrams[lower] ?: 0) + 1
-        learnedUnigrams[lower] = newFreq
-        trie.insert(clean, 2200 + newFreq * 25, isCustom = !BuiltInLexicon.coreWords.any { it.first == lower })
-
-        if (!prevWord.isNullOrBlank()) {
-            val prevLower = prevWord.trim().lowercase()
-            val nextMap = learnedBigrams.getOrPut(prevLower) { ConcurrentHashMap() }
-            nextMap[lower] = (nextMap[lower] ?: 0) + 1
-        }
+        ngramPredictor.recordSequence(clean, prevWord, prevPrevWord)
+        val existingFreq = trie.getEntry(lower)?.frequency ?: 2200
+        trie.insert(
+            word = clean,
+            frequency = existingFreq + 25,
+            isCustom = !BuiltInLexicon.coreWords.any { it.first == lower }
+        )
     }
 
     fun suggest(
@@ -96,12 +91,13 @@ class SmartKeyboardEngine {
         prevWord: String?,
         prevPrevWord: String?,
         snippets: List<SnippetEntity>,
-        autoCorrectLevel: AutoCorrectLevel = AutoCorrectLevel.BALANCED
+        autoCorrectLevel: AutoCorrectLevel = AutoCorrectLevel.BALANCED,
+        touchSamples: List<TouchSample> = emptyList()
     ): EngineResult {
         val startNs = System.nanoTime()
         var evaluated = 0
 
-        // 1. Check snippet trigger match (e.g. ;omw or ;date)
+        // 1. Check deterministic semicolon snippet trigger (e.g. ;omw or ;date)
         if (currentWord.startsWith(";") && currentWord.length >= 2) {
             val lower = currentWord.lowercase()
             val matched = snippets.filter { it.isEnabled && it.trigger.lowercase().startsWith(lower) }
@@ -125,7 +121,7 @@ class SmartKeyboardEngine {
             }
         }
 
-        // 2. Check :emoji tag shortcut (e.g. :fire, :coffee)
+        // 2. Check :emoji keyword tag shortcut (e.g. :fire, :coffee)
         if (currentWord.startsWith(":") && currentWord.length >= 2) {
             val query = currentWord.drop(1).lowercase()
             val emojiMatches = BuiltInLexicon.emojiCatalog.filter { entry ->
@@ -151,13 +147,13 @@ class SmartKeyboardEngine {
 
         val cleanCurrent = currentWord.trim()
 
-        // 3. Empty current word -> Trigram + Bigram + Unigram Markov prediction
+        // 3. Empty current word -> Trigram + Bigram + Unigram N-Gram predictor
         if (cleanCurrent.isEmpty()) {
-            val predictions = predictNextWord(prevWord, prevPrevWord)
+            val predictions = ngramPredictor.predictNext(prevWord, prevPrevWord, limit = 4)
             val elapsedUs = (System.nanoTime() - startNs) / 1000L
             val label = when {
-                !prevPrevWord.isNullOrBlank() && !prevWord.isNullOrBlank() -> "Markov Trigram / Bigram"
-                !prevWord.isNullOrBlank() -> "Markov Bigram Transition"
+                !prevPrevWord.isNullOrBlank() && !prevWord.isNullOrBlank() -> "N-Gram Trigram / Bigram"
+                !prevWord.isNullOrBlank() -> "N-Gram Bigram Backoff"
                 else -> "Zipf Unigram Baseline"
             }
             return EngineResult(
@@ -202,25 +198,26 @@ class SmartKeyboardEngine {
             }
         }
 
-        // 6. Prefix completions from Trie
+        // 6. Prefix completions from Trie boosted by N-gram context
         val prefixes = trie.prefixCompletions(lower, limit = 6)
         evaluated += prefixes.size
         for (entry in prefixes) {
             val cased = applyCasePattern(entry.word, cleanCurrent)
             if (seenLower.add(cased.lowercase())) {
-                val bigramBoost = getBigramBoost(prevWord, entry.word)
+                val contextBoost = ngramPredictor.contextualBoost(prevWord, prevPrevWord, entry.word)
                 results.add(
                     Suggestion(
                         text = cased,
                         reason = if (entry.isCustom) SuggestionReason.PERSONAL else SuggestionReason.COMPLETION,
-                        score = 5_000.0 + entry.frequency + bigramBoost,
+                        score = 5_000.0 + entry.frequency + contextBoost,
                         isAutoCorrectTarget = false
                     )
                 )
             }
         }
 
-        // 7. Spatial Damerau-Levenshtein Fuzzy Autocorrect if word isn't exact (or assertive mode)
+        // 7. Coordinate-Aware Spatial Damerau-Levenshtein Fuzzy Autocorrect
+        val hasTouchTrace = touchSamples.size == cleanCurrent.length
         val shouldRunFuzzy = exactEntry == null ||
             (autoCorrectLevel == AutoCorrectLevel.ASSERTIVE && cleanCurrent.length >= 3)
 
@@ -237,13 +234,16 @@ class SmartKeyboardEngine {
                 val wLower = entry.word.lowercase()
                 if (wLower == lower) continue
                 if (abs(wLower.length - lower.length) > 2) continue
-                // Quick char overlap heuristic before running full DP
                 evaluated++
-                val dist = spatialDamerauLevenshtein(lower, wLower)
+                val dist = if (hasTouchTrace) {
+                    spatialTouchDamerauLevenshtein(lower, touchSamples, wLower)
+                } else {
+                    spatialDamerauLevenshtein(lower, wLower)
+                }
                 if (dist <= maxDist) {
-                    val bigramBoost = getBigramBoost(prevWord, wLower)
+                    val contextBoost = ngramPredictor.contextualBoost(prevWord, prevPrevWord, wLower)
                     val freqNorm = entry.frequency.toDouble()
-                    val candidateScore = 7_500.0 + freqNorm + bigramBoost - (dist * 1_650.0)
+                    val candidateScore = 7_500.0 + freqNorm + contextBoost - (dist * 1_650.0)
                     val cased = applyCasePattern(entry.word, cleanCurrent)
                     fuzzyCandidates.add(
                         Suggestion(
@@ -264,13 +264,11 @@ class SmartKeyboardEngine {
             }
         }
 
-        // Sort and keep top 4, ensuring at most one isAutoCorrectTarget
         val sorted = results.sortedWith(
             compareByDescending<Suggestion> { it.isAutoCorrectTarget }
                 .thenByDescending { it.score }
         ).take(4)
 
-        // If exact word exists and is top score, don't force autocorrect unless knownTypoFix
         val finalized = if (exactEntry != null && knownTypoFix == null) {
             sorted.map { it.copy(isAutoCorrectTarget = false) }
         } else {
@@ -287,9 +285,10 @@ class SmartKeyboardEngine {
 
         val elapsedUs = (System.nanoTime() - startNs) / 1000L
         val algoName = when {
-            finalized.any { it.reason == SuggestionReason.AUTOCORRECT } -> "Spatial Edit + Trie"
+            finalized.any { it.reason == SuggestionReason.AUTOCORRECT } ->
+                if (hasTouchTrace) "Touch-Coord Spatial Edit" else "Spatial Edit + Trie"
             finalized.any { it.reason == SuggestionReason.PERSONAL } -> "Personal Lexicon Trie"
-            else -> "Prefix Trie Lookup"
+            else -> "Prefix Trie + N-Gram"
         }
         return EngineResult(
             suggestions = finalized,
@@ -300,19 +299,18 @@ class SmartKeyboardEngine {
     fun decodeGlidePath(
         points: List<Offset>,
         keyCenters: Map<Char, Offset>,
-        prevWord: String?
+        prevWord: String?,
+        prevPrevWord: String? = null
     ): EngineResult {
         val startNs = System.nanoTime()
         if (points.size < 3 || keyCenters.isEmpty()) {
             return EngineResult(emptyList(), EngineTelemetry("Glide Cancelled", 0L, 0))
         }
 
-        // Resample touch stroke to 16 equidistant points for geometric invariance
         val resampled = resamplePath(points, 16)
         val startPt = resampled.first()
         val endPt = resampled.last()
 
-        // Find top 3 closest keys to start point and end point
         val startKeys = keyCenters.entries
             .sortedBy { hypot((it.value.x - startPt.x).toDouble(), (it.value.y - startPt.y).toDouble()) }
             .take(3)
@@ -347,15 +345,14 @@ class SmartKeyboardEngine {
             }
             val avgDist = totalDist / 16.0
 
-            // Normalize by average key pitch (~keyCenters horizontal spacing)
             val qPos = keyCenters['q']
             val pPos = keyCenters['p']
             val keyWidth = if (qPos != null && pPos != null) abs(pPos.x - qPos.x) / 9f else 90f
             val normalizedError = avgDist / max(keyWidth, 24f)
 
             if (normalizedError <= 1.35) {
-                val bigramBoost = getBigramBoost(prevWord, w)
-                val score = 10_000.0 - (normalizedError * 3_200.0) + entry.frequency * 0.6 + bigramBoost
+                val contextBoost = ngramPredictor.contextualBoost(prevWord, prevPrevWord, w)
+                val score = 10_000.0 - (normalizedError * 3_200.0) + entry.frequency * 0.6 + contextBoost
                 candidates.add(
                     Suggestion(
                         text = entry.word,
@@ -383,96 +380,42 @@ class SmartKeyboardEngine {
             .replace("{iso}", SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(now))
     }
 
-    private fun predictNextWord(prevWord: String?, prevPrevWord: String?): List<Suggestion> {
-        val collected = ArrayList<Suggestion>(6)
-        val seen = HashSet<String>()
+    /**
+     * Touch-coordinate-aware Damerau-Levenshtein distance using recorded [TouchSample] coordinates
+     * at each character index.
+     */
+    fun spatialTouchDamerauLevenshtein(
+        typed: String,
+        touchSamples: List<TouchSample>,
+        candidate: String
+    ): Float {
+        if (touchSamples.size != typed.length) return spatialDamerauLevenshtein(typed, candidate)
+        val m = typed.length
+        val n = candidate.length
+        if (m == 0) return n.toFloat()
+        if (n == 0) return m.toFloat()
 
-        if (!prevPrevWord.isNullOrBlank() && !prevWord.isNullOrBlank()) {
-            val trigramKey = "${prevPrevWord.lowercase()} ${prevWord.lowercase()}"
-            BuiltInLexicon.trigrams[trigramKey]?.forEach { (next, weight) ->
-                if (seen.add(next.lowercase())) {
-                    collected.add(
-                        Suggestion(
-                            text = next,
-                            reason = SuggestionReason.TRIGRAM,
-                            score = 5000.0 + weight
-                        )
+        val dp = Array(m + 1) { FloatArray(n + 1) }
+        for (i in 0..m) dp[i][0] = i.toFloat()
+        for (j in 0..n) dp[0][j] = j.toFloat()
+
+        for (i in 1..m) {
+            for (j in 1..n) {
+                val subCost = SpatialLayoutModel.touchSubstitutionCost(touchSamples[i - 1], candidate[j - 1])
+                var best = min(
+                    dp[i - 1][j] + 0.9f,
+                    min(
+                        dp[i][j - 1] + 0.9f,
+                        dp[i - 1][j - 1] + subCost
                     )
+                )
+                if (i > 1 && j > 1 && typed[i - 1] == candidate[j - 2] && typed[i - 2] == candidate[j - 1]) {
+                    best = min(best, dp[i - 2][j - 2] + 0.45f)
                 }
+                dp[i][j] = best
             }
         }
-
-        if (!prevWord.isNullOrBlank()) {
-            val prevLower = prevWord.lowercase()
-            // Personal learned bigrams take priority!
-            learnedBigrams[prevLower]?.entries
-                ?.sortedByDescending { it.value }
-                ?.take(3)
-                ?.forEach { (next, count) ->
-                    if (seen.add(next.lowercase())) {
-                        collected.add(
-                            Suggestion(
-                                text = next,
-                                reason = SuggestionReason.PERSONAL,
-                                score = 4800.0 + count * 40.0
-                            )
-                        )
-                    }
-                }
-
-            BuiltInLexicon.bigrams[prevLower]?.forEach { (next, weight) ->
-                if (seen.add(next.lowercase())) {
-                    collected.add(
-                        Suggestion(
-                            text = next,
-                            reason = SuggestionReason.BIGRAM,
-                            score = 4000.0 + weight
-                        )
-                    )
-                }
-            }
-        }
-
-        if (collected.size < 4) {
-            val starters = listOf("I", "The", "Yes", "Thanks", "On", "Let's", "Sounds")
-            for (s in starters) {
-                if (collected.size >= 4) break
-                if (seen.add(s.lowercase())) {
-                    collected.add(
-                        Suggestion(
-                            text = s,
-                            reason = SuggestionReason.COMPLETION,
-                            score = 1000.0
-                        )
-                    )
-                }
-            }
-        }
-
-        return collected.sortedByDescending { it.score }.take(4)
-    }
-
-    private fun getBigramBoost(prevWord: String?, candidate: String): Double {
-        if (prevWord.isNullOrBlank()) return 0.0
-        val prevLower = prevWord.lowercase()
-        val candLower = candidate.lowercase()
-        val personal = learnedBigrams[prevLower]?.get(candLower) ?: 0
-        val builtIn = BuiltInLexicon.bigrams[prevLower]?.firstOrNull { it.first == candLower }?.second ?: 0
-        return personal * 250.0 + builtIn * 12.0
-    }
-
-    private fun applyCasePattern(target: String, typed: String): String {
-        if (typed.isEmpty()) return target
-        if (target == "I" || target.startsWith("I'")) return target
-        val letters = typed.filter { it.isLetter() }
-        if (letters.isEmpty()) return target
-        return when {
-            letters.length > 1 && letters.all { it.isUpperCase() } -> target.uppercase()
-            letters.first().isUpperCase() -> target.replaceFirstChar {
-                if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString()
-            }
-            else -> target
-        }
+        return dp[m][n]
     }
 
     /**
@@ -492,19 +435,33 @@ class SmartKeyboardEngine {
             for (j in 1..n) {
                 val subCost = SpatialLayoutModel.substitutionCost(a[i - 1], b[j - 1])
                 var best = min(
-                    dp[i - 1][j] + 0.9f, // deletion
+                    dp[i - 1][j] + 0.9f,
                     min(
-                        dp[i][j - 1] + 0.9f, // insertion
-                        dp[i - 1][j - 1] + subCost // substitution
+                        dp[i][j - 1] + 0.9f,
+                        dp[i - 1][j - 1] + subCost
                     )
                 )
                 if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
-                    best = min(best, dp[i - 2][j - 2] + 0.45f) // adjacent transposition
+                    best = min(best, dp[i - 2][j - 2] + 0.45f)
                 }
                 dp[i][j] = best
             }
         }
         return dp[m][n]
+    }
+
+    private fun applyCasePattern(target: String, typed: String): String {
+        if (typed.isEmpty()) return target
+        if (target == "I" || target.startsWith("I'")) return target
+        val letters = typed.filter { it.isLetter() }
+        if (letters.isEmpty()) return target
+        return when {
+            letters.length > 1 && letters.all { it.isUpperCase() } -> target.uppercase()
+            letters.first().isUpperCase() -> target.replaceFirstChar {
+                if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString()
+            }
+            else -> target
+        }
     }
 
     private fun resamplePath(points: List<Offset>, targetCount: Int): List<Offset> {

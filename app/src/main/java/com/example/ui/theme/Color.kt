@@ -5,6 +5,7 @@ import androidx.compose.ui.graphics.Color
 // Tactile Precision Studio Palette
 val StudioTerracotta = Color(0xFFE85D2A)
 val StudioTerracottaSoft = Color(0xFFFFEDE6)
+val StudioTerracottaLight = Color(0xFFFFB299)
 val StudioTerracottaDark = Color(0xFF9E340E)
 
 val StudioCobalt = Color(0xFF2B59FF)
@@ -13,6 +14,7 @@ val StudioCobaltLight = Color(0xFF8CA8FF)
 
 val StudioEmerald = Color(0xFF1F9D68)
 val StudioEmeraldSoft = Color(0xFFE3F7EE)
+val StudioEmeraldLight = Color(0xFF7BF2B9)
 
 val StudioAmber = Color(0xFFD97706)
 val StudioAmberSoft = Color(0xFFFEF3C7)

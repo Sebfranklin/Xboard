@@ -76,7 +76,9 @@ import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.PaperWhite
 import com.example.ui.theme.StudioEmerald
+import com.example.ui.theme.StudioEmeraldLight
 import com.example.ui.theme.StudioTerracotta
+import com.example.ui.theme.StudioTerracottaLight
 
 @Composable
 fun StudioScreen(
@@ -182,8 +184,9 @@ fun StudioScreen(
                             }
                         }
 
-                        // Drafting text display with visible cursor position
+                        // Drafting text display with visible cursor position and composing underline
                         val tfv = viewModel.sandboxTarget.value
+                        val composing = viewModel.sandboxTarget.composingRange
                         val cursor = tfv.selection.start.coerceIn(0, tfv.text.length)
                         val annotated = buildAnnotatedString {
                             if (tfv.text.isEmpty()) {
@@ -194,11 +197,31 @@ fun StudioScreen(
                                     append(" Tap or glide keys below...")
                                 }
                             } else {
-                                append(tfv.text.substring(0, cursor))
-                                withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)) {
-                                    append("|")
+                                tfv.text.forEachIndexed { idx, ch ->
+                                    if (idx == cursor) {
+                                        withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)) {
+                                            append("|")
+                                        }
+                                    }
+                                    val inComposing = composing != null && idx in composing.start until composing.end
+                                    if (inComposing) {
+                                        withStyle(
+                                            SpanStyle(
+                                                textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                        ) {
+                                            append(ch)
+                                        }
+                                    } else {
+                                        append(ch)
+                                    }
                                 }
-                                append(tfv.text.substring(cursor))
+                                if (cursor == tfv.text.length) {
+                                    withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)) {
+                                        append("|")
+                                    }
+                                }
                             }
                         }
 
@@ -426,7 +449,7 @@ private fun HeroSetupCard(
 @Composable
 private fun StatusBadge(label: String, isPositive: Boolean) {
     val bg = if (isPositive) StudioEmerald.copy(alpha = 0.25f) else StudioTerracotta.copy(alpha = 0.25f)
-    val fg = if (isPositive) Color(0xFF7BF2B9) else Color(0xFFFFB299)
+    val fg = if (isPositive) StudioEmeraldLight else StudioTerracottaLight
     Row(
         modifier = Modifier
             .clip(RoundedCornerShape(20.dp))

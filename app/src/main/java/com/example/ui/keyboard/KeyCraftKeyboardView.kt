@@ -76,6 +76,7 @@ import com.example.data.SnippetEntity
 import com.example.engine.SpatialLayoutModel
 import com.example.engine.Suggestion
 import com.example.engine.SuggestionReason
+import com.example.engine.TouchSample
 import com.example.ui.theme.KeyboardPalette
 import com.example.ui.theme.PlusJakartaFamily
 import com.example.ui.theme.SpaceGroteskFamily
@@ -199,7 +200,7 @@ fun KeyCraftKeyboardView(
                         numberRowHeight = numberRowHeight,
                         settings = settings,
                         uiState = uiState,
-                        onLetterCommit = { controller.onCharacterPressed(it, settings, snippets) },
+                        onLetterCommit = { ch, sample -> controller.onCharacterPressed(ch, settings, snippets, sample) },
                         onGlideComplete = { pts, centers ->
                             controller.onGlideCompleted(pts, centers, settings, snippets)
                         },
@@ -491,7 +492,7 @@ private fun QwertyKeyboardGrid(
     numberRowHeight: Dp,
     settings: KeyboardSettings,
     uiState: KeyboardUiState,
-    onLetterCommit: (String) -> Unit,
+    onLetterCommit: (String, TouchSample?) -> Unit,
     onGlideComplete: (List<Offset>, Map<Char, Offset>) -> Unit,
     onPopupChange: (ActiveKeyPopup?) -> Unit,
     onShiftTap: () -> Unit,
@@ -565,7 +566,7 @@ private fun QwertyKeyboardGrid(
                         contentDescriptionText = "Number $digit",
                         modifier = Modifier.weight(1f),
                         hapticEnabled = settings.hapticFeedback,
-                        onClick = { onLetterCommit(digit) }
+                        onClick = { onLetterCommit(digit, null) }
                     ) {
                         Text(
                             text = digit,
@@ -644,21 +645,68 @@ private fun QwertyKeyboardGrid(
                             }
                         } else null
 
+                        var activePointerId = down.id
+                        var currentDownPos = startPos
+                        var currentTouchPos = startPos
                         var currentHoverChar = startChar
 
                         try {
                             while (true) {
                                 val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                // Fast two-thumb rollover: if a second finger goes down while tapping (not gliding/alternates),
+                                // commit the first key immediately and transfer tracking to the new pointer.
+                                val newFingerDown = event.changes.firstOrNull {
+                                    it.id != activePointerId && it.pressed && !it.previousPressed
+                                }
+                                if (newFingerDown != null && !isGliding && !alternatesOpen) {
+                                    val nextChar = findNearestLetter(newFingerDown.position)
+                                    if (nextChar != null) {
+                                        longPressJob?.cancel()
+                                        val rolloverSample = SpatialLayoutModel.toNormalizedTouch(
+                                            pos = currentTouchPos,
+                                            keyBounds = keyBounds,
+                                            fallbackChar = currentHoverChar
+                                        )
+                                        onLetterCommit(displayChar(currentHoverChar), rolloverSample)
+                                        activePointerId = newFingerDown.id
+                                        currentDownPos = newFingerDown.position
+                                        currentTouchPos = newFingerDown.position
+                                        currentHoverChar = nextChar
+                                        pressedChar = nextChar
+                                        glidePoints.clear()
+                                        glidePoints.add(newFingerDown.position)
+                                        if (settings.hapticFeedback) {
+                                            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        }
+                                        val nextRect = keyBounds[nextChar]
+                                        if (settings.keyPopups && nextRect != null) {
+                                            onPopupChange(
+                                                ActiveKeyPopup(
+                                                    baseChar = nextChar,
+                                                    label = displayChar(nextChar),
+                                                    centerX = nextRect.center.x,
+                                                    topY = nextRect.top,
+                                                    alternates = SpatialLayoutModel.longPressAlternates[nextChar].orEmpty(),
+                                                    showAlternates = false
+                                                )
+                                            )
+                                        }
+                                        newFingerDown.consume()
+                                        continue
+                                    }
+                                }
+
+                                val change = event.changes.firstOrNull { it.id == activePointerId } ?: break
+                                currentTouchPos = change.position
                                 if (!change.pressed) {
                                     change.consume()
                                     break
                                 }
                                 val pos = change.position
-                                val distFromStart = hypot((pos.x - startPos.x).toDouble(), (pos.y - startPos.y).toDouble()).toFloat()
+                                val distFromStart = hypot((pos.x - currentDownPos.x).toDouble(), (pos.y - currentDownPos.y).toDouble()).toFloat()
 
                                 if (alternatesOpen && alts.isNotEmpty()) {
-                                    val dxFromStart = pos.x - startPos.x
+                                    val dxFromStart = pos.x - currentDownPos.x
                                     val offsetSteps = (dxFromStart / altStepPx).toInt()
                                     val newIdx = offsetSteps.coerceIn(0, alts.lastIndex)
                                     if (newIdx != selectedAltIdx) {
@@ -666,13 +714,14 @@ private fun QwertyKeyboardGrid(
                                         if (settings.hapticFeedback) {
                                             haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         }
-                                        if (startRect != null) {
+                                        val rectForAlt = keyBounds[currentHoverChar]
+                                        if (rectForAlt != null) {
                                             onPopupChange(
                                                 ActiveKeyPopup(
-                                                    baseChar = startChar,
-                                                    label = displayChar(startChar),
-                                                    centerX = startRect.center.x,
-                                                    topY = startRect.top,
+                                                    baseChar = currentHoverChar,
+                                                    label = displayChar(currentHoverChar),
+                                                    centerX = rectForAlt.center.x,
+                                                    topY = rectForAlt.top,
                                                     alternates = alts,
                                                     showAlternates = true,
                                                     selectedAlternateIndex = selectedAltIdx
@@ -682,7 +731,7 @@ private fun QwertyKeyboardGrid(
                                     }
                                 } else if (settings.glideTypingEnabled && distFromStart > glideSlopPx) {
                                     val hovered = findNearestLetter(pos)
-                                    if (!isGliding && (hovered != startChar || distFromStart > glideSlopPx * 1.8f)) {
+                                    if (!isGliding && (hovered != currentHoverChar || distFromStart > glideSlopPx * 1.8f)) {
                                         isGliding = true
                                         longPressJob?.cancel()
                                         onPopupChange(null)
@@ -724,14 +773,19 @@ private fun QwertyKeyboardGrid(
                                 val finalChar = if (uiState.shiftState != ShiftState.OFF && chosen.length == 1 && chosen[0].isLetter()) {
                                     chosen.uppercase()
                                 } else chosen
-                                onLetterCommit(finalChar)
+                                onLetterCommit(finalChar, null)
                             }
                             isGliding && glidePoints.size >= 4 -> {
                                 val centers = keyBounds.mapValues { it.value.center }
                                 onGlideComplete(glidePoints.toList(), centers)
                             }
                             else -> {
-                                onLetterCommit(displayChar(currentHoverChar))
+                                val tapSample = SpatialLayoutModel.toNormalizedTouch(
+                                    pos = currentTouchPos,
+                                    keyBounds = keyBounds,
+                                    fallbackChar = currentHoverChar
+                                )
+                                onLetterCommit(displayChar(currentHoverChar), tapSample)
                             }
                         }
 
