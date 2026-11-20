@@ -1,0 +1,6 @@
+{
+  "name": "KeyCraft",
+  "description": "A deterministic, zero-AI smart Android keyboard featuring spatial autocorrect, statistical n-gram prediction, glide typing, snippets, and clipboard history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

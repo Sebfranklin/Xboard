@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">KeyCraft</string>
+    <string name="ime_service_label">KeyCraft</string>
+    <string name="ime_subtype_en_us">English (US) · Tactile</string>
+    <string name="nav_studio">Studio</string>
+    <string name="nav_snippets">Snippets</string>
+    <string name="nav_lexicon">Lexicon</string>
+    <string name="nav_tuning">Tuning</string>
+    <string name="status_enabled">Enabled</string>
+    <string name="status_disabled">Not Enabled</string>
+    <string name="status_active">Active Input</string>
+    <string name="status_inactive">Not Selected</string>
+    <string name="action_enable_ime">Enable in Settings</string>
+    <string name="action_switch_ime">Select KeyCraft</string>
+</resources>
